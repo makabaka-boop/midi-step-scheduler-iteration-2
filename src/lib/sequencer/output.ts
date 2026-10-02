@@ -24,7 +24,20 @@ export interface MidiOutputAdapter {
 
 /** Wraps a Web MIDI MIDIOutput port. */
 export class WebMidiOutputAdapter implements MidiOutputAdapter {
-  constructor(private readonly port: MIDIOutput) {}
+  /**
+   * Source for the "now" floor applied to outbound timestamps. In the
+   * browser this is performance.now() (the same clock as Web MIDI);
+   * deterministic tests inject the scheduler clock so the recorded
+   * timestamps are the scheduler's, not the host wall clock's.
+   */
+  private readonly now: () => number;
+
+  constructor(port: MIDIOutput, now: () => number = () => performance.now()) {
+    this.port = port;
+    this.now = now;
+  }
+
+  private readonly port: MIDIOutput;
 
   get id(): string {
     return this.port.id ?? this.port.name ?? 'unknown';
@@ -45,7 +58,7 @@ export class WebMidiOutputAdapter implements MidiOutputAdapter {
       // never in the future; clamp defensively because some
       // implementations reject past timestamps instead of sending
       // immediately as the spec intends.
-      const ts = timeMs !== undefined ? Math.max(timeMs, performance.now()) : undefined;
+      const ts = timeMs !== undefined ? Math.max(timeMs, this.now()) : undefined;
       this.port.send(message, ts);
     } catch {
       // A port can disconnect between the state check and send(); ignore.

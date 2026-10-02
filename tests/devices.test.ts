@@ -70,6 +70,53 @@ describe('MidiDeviceManager', () => {
   });
 });
 
+describe('MidiDeviceManager inputs', () => {
+  it('lists inputs and tracks hot-plug / disconnect separately from outputs', async () => {
+    const access = new FakeMidiAccess();
+    access.plugOutput('oa', 'Out A');
+    access.plugInput('ia', 'Keys A');
+    const manager = new MidiDeviceManager(() =>
+      Promise.resolve(access as unknown as MidiAccessLike)
+    );
+    const inputChanges: string[][] = [];
+    let disconnectedId: string | null = null;
+    manager.setEvents({
+      onInputsChanged: (inputs) => inputChanges.push(inputs.map((i) => i.id)),
+      onInputDisconnected: (id) => {
+        disconnectedId = id;
+      }
+    });
+    await manager.request();
+    expect(manager.inputs.map((i) => i.id)).toEqual(['ia']);
+    expect(manager.outputs.map((o) => o.id)).toEqual(['oa']);
+
+    access.plugInput('ib', 'Keys B');
+    expect(manager.inputs.map((i) => i.id)).toEqual(['ia', 'ib']);
+    access.unplug('ia');
+    expect(disconnectedId).toBe('ia');
+    expect(manager.inputs.find((i) => i.id === 'ia')?.connected).toBe(false);
+    expect(inputChanges.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('delivers injected messages through an input adapter', async () => {
+    const access = new FakeMidiAccess();
+    const port = access.plugInput('ia', 'Keys A');
+    const manager = new MidiDeviceManager(() =>
+      Promise.resolve(access as unknown as MidiAccessLike)
+    );
+    await manager.request();
+    const adapter = manager.inputAdapterFor('ia')!;
+    expect(adapter).not.toBeNull();
+    const received: { data: number[]; time: number }[] = [];
+    adapter.onMessage((data, time) => received.push({ data, time: Number(time) }));
+    port.emit([0x90, 60, 100], 123);
+    expect(received).toEqual([{ data: [0x90, 60, 100], time: 123 }]);
+    access.unplug('ia');
+    expect(adapter.connected).toBe(false);
+    expect(manager.inputAdapterFor('ia')).toBeNull();
+  });
+});
+
 describe('Controller + devices integration', () => {
   it('auto-selects the first connected output and plays through it', async () => {
     const access = new FakeMidiAccess();

@@ -500,6 +500,53 @@ describe('Scheduler live score editing', () => {
   });
 });
 
+describe('Scheduler beat mapping (recorder timeline)', () => {
+  it('maps a clock time onto the global step whose boundary is at or before it', () => {
+    const { clock, scheduler } = makeRig({ tracks: [{ length: 8, enabled: [] }] });
+    scheduler.play();
+    clock.advance(100); // step 0 sounding (boundary t=1)
+    expect(scheduler.locateBeat(100).step).toBe(0);
+    expect(scheduler.locateBeat(126).step).toBe(1); // step 1 boundary
+    expect(scheduler.locateBeat(250).step).toBe(1);
+    expect(scheduler.locateBeat(251).step).toBe(2);
+  });
+
+  it('exposes the step duration in force', () => {
+    const { scheduler } = makeRig({ tracks: [{ length: 8, enabled: [] }] });
+    scheduler.play();
+    expect(scheduler.locateBeat(0).stepDur).toBeCloseTo(STEP_MS, 5);
+  });
+
+  it('beat mapping follows a tempo change using the replanned grid', () => {
+    const rig = makeRig({ tracks: [{ length: 64, enabled: [] }] });
+    let tempo = BPM;
+    const scheduler = new Scheduler({
+      clock: rig.clock,
+      getPattern: () => rig.pattern,
+      getTempo: () => tempo
+    });
+    scheduler.setOutput(rig.out);
+    scheduler.play();
+    rig.clock.advance(110); // step 0 sounding
+    tempo = 240; // 62.5ms per step
+    scheduler.tempoChanged();
+    // Replanned next step is clamped to now (110). A note just after a
+    // replanned boundary maps onto the new 62.5ms grid.
+    rig.clock.advance(1); // t=111, step 1 boundary in force
+    const mapped = scheduler.locateBeat(rig.clock.now());
+    expect(mapped.step).toBe(1);
+    expect(mapped.stepDur).toBeCloseTo(62.5, 4);
+    rig.clock.advance(63); // one more new-grid step
+    expect(scheduler.locateBeat(rig.clock.now()).step).toBe(2);
+  });
+
+  it('returns the conventional origin when stopped', () => {
+    const { scheduler } = makeRig({ tracks: [{ length: 8, enabled: [] }] });
+    expect(scheduler.locateBeat(500).step).toBe(0);
+    expect(scheduler.playingStep).toBe(-1);
+  });
+});
+
 describe('Scheduler shared channel and pitch', () => {
   it('releasing one overlapping voice never sends note-off while another holds the key', () => {
     // Both tracks share channel 0 / pitch 60, starting together at t=1:

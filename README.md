@@ -8,7 +8,9 @@
 - 每步参数：音高（0–127，带音名显示）、力度（1–127）、门长（步长的 5%–100%）
 - 播放 / 暂停 / 停止，20–300 BPM 实时变速
 - 输出设备下拉选择；设备热插拔自动更新，断开的设备会标注并触发清理
+- **单轨"录制待确认"**：一边播放一边用 MIDI 键盘录一轮演奏，按调度器的节拍轴量化到步格；确认时一次提交，取消/停止/设备断开/授权失效即丢弃草稿
 - **无 Web MIDI 或未授权时**：乐谱编辑完全可用，播放按钮禁用——绝不假装在播放
+- **无 MIDI 输入时**：编辑与播放照常，录制按钮禁用——录制从不影响原乐谱与输出
 
 ## 快速开始（Docker）
 
@@ -19,7 +21,7 @@ docker compose run --rm verify  # 一次性验收：类型检查 + 全部测试 
 docker compose up web           # 开发服务器：http://localhost:5173
 ```
 
-`verify` 服务以退出码报告结果：0 表示类型检查、46 项测试与生产构建全部通过。
+`verify` 服务以退出码报告结果：0 表示类型检查、90 项测试与生产构建全部通过。
 
 ## 本地开发
 
@@ -40,12 +42,14 @@ npm run verify     # 上述三者依次执行（与 Docker verify 相同）
 src/lib/sequencer/
   types.ts      乐谱模型（Pattern/Track/Step）与约束（1–8 轨、1–64 步）
   clock.ts      可替换时钟：BrowserClock（生产）/ ManualClock（测试）
-  midi.ts       MIDI 消息构造函数（noteOn/noteOff/…）
+  midi.ts       MIDI 消息构造函数（noteOn/noteOff/…）与 note 消息解析
   output.ts     输出适配器：Web MIDI 端口 / 测试记录适配器
-  scheduler.ts  前瞻调度器（核心）
-  devices.ts    Web MIDI 访问、设备列表、热插拔跟踪
-src/lib/controller.ts  控制器：连接调度器、设备管理器与 Svelte stores
-src/lib/components/    Transport / TrackGrid / StepEditor
+  input.ts      输入适配器：Web MIDI 端口 / SimulatedMidiInput（测试）
+  scheduler.ts  前瞻调度器（核心）+ 节拍映射 locateBeat + 提交对账 stepsCommitted
+  recorder.ts   单轨录制会话：独立草稿、量化、门长换算与全部裁决
+  devices.ts    Web MIDI 访问、输入/输出设备列表、热插拔跟踪
+src/lib/controller.ts  控制器：连接调度器、设备管理器、录制会话与 Svelte stores
+src/lib/components/    Transport / TrackGrid / StepEditor / RecordingPanel
 ```
 
 ### 前瞻调度
@@ -86,23 +90,42 @@ src/lib/components/    Transport / TrackGrid / StepEditor
 
 重新触发同一音符时，**同一轨道**前一个实例的 note-off 会被钳制到新 note-on 的时刻，避免同音重叠；其他轨道同音高的声音按独立声音处理，不受影响。
 
+### 单轨"录制待确认"流程
+
+排练者点播放、选好 MIDI 键盘并在某条音轨上点**录制本轮**后，进入"录制待确认"。输入设备的 note-on/note-off 经**调度器自己的节拍轴**（`locateBeat`，按当前 tempo 网格的步边界）量化到该轨本轮步格，门长由真实按键时长 ÷ 该步时长换算（5%–100%）。
+
+- **独立草稿**：录制期间只写一份与乐谱分离的草稿，**绝不**改动正在播放的乐谱、也不往输出排队或发送消息——键盘输入不会被自己听见；其他音轨与共享通道完全不受影响。
+- **一次提交**：点**确认提交**时，把本轮的完整步格成批写入该轨，再调用调度器 `stepsCommitted` 就地对账（按步格升序，消息顺序确定）；未弹奏的格保留原值（叠加录音），其他音轨的节拍与事件不动。
+- **稳定可见的裁决**（都进入草稿的裁决列表）：
+  - **同音高重触发**：前一音符在新触发时刻闭合，两个音符不重叠、不卡音，旧音按真实时长留在原格；
+  - **跨循环尾部**：持续到下一轮边界的音符门长钳为 100%，不延续/污染下一轮的格；超过一格的普通长音同样钳到 100%；
+  - **同一格竞争**：一个步格至多一个音符，**后到的 onset 胜出**，被替换的记录以裁决标出；
+  - **零力度 note-on**：按 MIDI 约定解释为 note-off；无配对的 note-off 忽略；确认时仍悬挂（没有 note-off）的音符是不完整对，丢弃不计入提交。
+- **取消即丢弃**：点取消、暂停/停止、输入设备断开或授权失效，都丢弃未确认草稿并清理悬挂音符（仅草稿状态，不触碰输出）。停止/暂停会连带结束录制；输入断开只丢弃草稿，**播放继续**。
+- 录制只监听该轨的 MIDI 通道；录制中不允许切换输入设备，避免一次演奏被两个适配器拆开。
+
+节拍映射使用调度器维护的**当前 tempo 网格锚点**（播放起点与每次变速处更新）：变速只影响变速后到达的音符，已录入音符的步时长在其 note-on 时冻结——与"历史消息绝不改写"一致。
+
 ### 可测试性
 
 调度器只依赖 `Clock` 与 `MidiOutputAdapter` 两个接口：
 
 - `ManualClock` 让测试手动推进时间，可精确模拟**迟到回调**（计时器回调观察到跳跃后的真实时间）、**停止边界**（到期但未派发的步被取消）、**重复点击**（任意 play/stop 序列后至多一个定时器、无重复音符）；
 - `RecordingOutputAdapter` 记录每条消息及其时间戳，断言无需真实硬件；
-- `FakeMidiAccess`（`tests/fakeMidi.ts`）模拟设备**热插拔**与断开；
-- 页面测试在 jsdom 中渲染完整应用（无 `navigator.requestMIDIAccess`），验证"可编辑但不假装播放"。
+- `FakeMidiAccess`（`tests/fakeMidi.ts`）模拟输入/输出设备的**热插拔**、断开与带时间戳的注入消息；
+- `SimulatedMidiInput`（`src/lib/sequencer/input.ts`）是确定性的模拟 MIDI 键盘：配合 `ManualClock` 精确覆盖**变速量化、同音高重触发、跨循环尾部、同格竞争、零力度 note-on、输入断开及确认瞬间的输出消息顺序**；
+- 页面测试在 jsdom 中渲染完整应用（无 `navigator.requestMIDIAccess`），验证"可编辑但不假装播放"，以及无输入设备时录制控件禁用。
 
 ## 测试
 
-`npm test`（Vitest）共 46 项：
+`npm test`（Vitest）共 90 项：
 
-- `tests/scheduler.test.ts` — 前瞻排程、变速重排、停止/暂停清理、迟到回调、重复点击、设备切换与断开、门长、多轨独立循环、重触发保护、**播放中编辑（关闭/音高/力度/门长/缩短/静音且不带动其他轨）、共享通道同音高的独立声音**
+- `tests/scheduler.test.ts` — 前瞻排程、变速重排、停止/暂停清理、迟到回调、重复点击、设备切换与断开、门长、多轨独立循环、重触发保护、**播放中编辑、共享通道同音高、节拍映射 locateBeat（含变速网格）**
+- `tests/recorder.test.ts` — 录制会话：量化与门长、同音高重触发、跨循环尾部、同格竞争、零力度/孤立 note-off、通道过滤、取消/确认/不完整音符、循环轮次
+- `tests/recording.test.ts` — 真实调度器 + ManualClock + 模拟键盘的端到端：变速、重触发、尾部、竞争、零力度、草稿隔离、确认提交的输出消息顺序、取消/停止/暂停/输入断开/授权场景、不影响其他轨与共享通道、无输入仍可编辑播放
 - `tests/stress.test.ts` — 400 拍随机编辑（开关/音高/门长/静音/伸缩/改通道/批量改）下的线路不变量：播放中绝不出现"未持有却 note-off"，停止后无卡音；编辑一条轨不改变另一条轨的步边界时刻
-- `tests/devices.test.ts` — 设备列表、热插拔、断开清理、切换输出、无 MIDI 时拒绝播放
-- `tests/app.test.ts` — 无 MIDI 硬件的页面级测试：编辑、增删轨、步数变更、播放禁用
+- `tests/devices.test.ts` — 输入/输出设备列表、热插拔、断开清理、切换输出、输入适配器消息、无 MIDI 时拒绝播放
+- `tests/app.test.ts` — 无 MIDI 硬件的页面级测试：编辑、增删轨、步数变更、播放禁用、录制控件禁用
 
 ## 验收
 

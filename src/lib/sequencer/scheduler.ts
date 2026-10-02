@@ -35,6 +35,13 @@
  * Pause, stop, output switch and output loss all run the same cleanup:
  * cancel every queued (unsent) message and immediately note-off every
  * wire key this scheduler started, so nothing can stick or fire twice.
+ *
+ * `locateBeat` exposes the current tempo grid for live-input recording:
+ * a keyboard event's clock time maps to the global step boundary at or
+ * before it, with the step duration in force (frozen per recorded note).
+ * `stepsCommitted` reconciles one recorded take's cells as a single
+ * ascending-order batch, so a confirmation applies like deterministic
+ * manual edits without rewinding the clock or moving other tracks.
  */
 
 import type { Clock, TimerHandle } from './clock';
@@ -110,6 +117,14 @@ export class Scheduler {
   private nextStepTime = 0;
   /** Last step boundary that came due (drives tempo-change re-planning). */
   private lastBoundary: { step: number; time: number } = { step: -1, time: 0 };
+  /**
+   * Origin of the *current* tempo grid: the step/time anchor from which
+   * boundaries run at `stepDuration()` right now. A tempo change moves it
+   * to the boundary in force at the change, so live input is beat-mapped
+   * onto exactly the grid playback is using (independent of when ticks
+   * happen to dispatch).
+   */
+  private gridAnchor: { step: number; time: number } = { step: 0, time: 0 };
 
   /** Queued, not yet dispatched events — the "已排队消息". */
   private pending: ScheduledEvent[] = [];
@@ -147,6 +162,16 @@ export class Scheduler {
 
   get position(): number {
     return this.stepIndex;
+  }
+
+  /**
+   * Global step the playhead is currently on while playing — the last
+   * reached boundary's step (the step sounding now). -1 before the first
+   * boundary. The recorder anchors a take's first loop on this.
+   */
+  get playingStep(): number {
+    if (this.state !== 'playing') return -1;
+    return this.lastBoundary.step;
   }
 
   get queuedEvents(): readonly ScheduledEvent[] {
@@ -196,6 +221,8 @@ export class Scheduler {
       step: this.stepIndex - 1,
       time: this.nextStepTime - this.stepDuration()
     };
+    // The current-tempo grid starts at the first step of this run.
+    this.gridAnchor = { step: this.stepIndex, time: this.nextStepTime };
     this.tick();
     return true;
   }
@@ -221,6 +248,7 @@ export class Scheduler {
     this.stepIndex = 0;
     this.nextStepTime = 0;
     this.lastBoundary = { step: -1, time: 0 };
+    this.gridAnchor = { step: 0, time: 0 };
   }
 
   /**
@@ -233,6 +261,9 @@ export class Scheduler {
     if (this.state !== 'playing') return;
     this.dropUndispatched();
     this.rewindToLastBoundary();
+    // From the change on, the grid runs at the new tempo from the next
+    // step boundary the replan anchored on.
+    this.gridAnchor = { step: this.stepIndex, time: this.nextStepTime };
   }
 
   /**
@@ -268,6 +299,48 @@ export class Scheduler {
   /** Duration of one step in ms at the current tempo. */
   stepDuration(): number {
     return 60000 / (this.getTempo() * STEPS_PER_BEAT);
+  }
+
+  /**
+   * Beat-map a clock timestamp onto the scheduler's global step grid.
+   *
+   * Used by the recorder to interpret live keyboard input against the
+   * *same* timeline the playback follows: the anchor is the last reached
+   * step boundary and the current step duration, so a tempo change only
+   * moves mapping for notes that arrive after it — already-played notes
+   * keep the duration captured when their note-on arrived, just as
+   * already-dispatched playback history is never rewritten.
+   *
+   * Returns the global step whose boundary is at or immediately before
+   * `timeMs`, the boundary's clock time and the step duration in force.
+   */
+  locateBeat(timeMs: number): { step: number; time: number; stepDur: number } {
+    const stepDur = Math.max(1, this.stepDuration());
+    if (this.lastBoundary.step < 0) {
+      // Never started (or fully stopped): expose the conventional origin.
+      return { step: 0, time: 0, stepDur };
+    }
+    // Map against the current-tempo grid anchor (the boundary in force at
+    // the last play() / tempo change), which is exactly where playback's
+    // boundaries objectively fall — independent of tick dispatch timing.
+    const { step: anchorStep, time: anchorTime } = this.gridAnchor;
+    const k = Math.floor((timeMs - anchorTime) / stepDur);
+    return { step: anchorStep + k, time: anchorTime + k * stepDur, stepDur };
+  }
+
+  /**
+   * Reconcile a batch of cells on one track after a recorded take is
+   * committed. The pattern already carries the recorded values; this
+   * applies them to queued/sounding voices exactly like the equivalent
+   * manual edits, with cells processed in ascending order so the order
+   * of the resulting wire messages is deterministic (a turned-off cell
+   * releases before a newly enabled cell can sound on a shared key).
+   */
+  stepsCommitted(trackId: string, cells: readonly number[]): void {
+    if (this.state !== 'playing') return;
+    for (const index of [...cells].sort((a, b) => a - b)) {
+      this.reconcileTrack(trackId, { cellIndex: index });
+    }
   }
 
   // -------------------------------------------------------------------

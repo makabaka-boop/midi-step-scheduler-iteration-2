@@ -85,4 +85,20 @@ describe('App without Web MIDI', () => {
     expect((screen.getByTestId('play') as HTMLButtonElement).disabled).toBe(true);
     expect(screen.getByText(/已停止/)).toBeTruthy();
   });
+
+  it('renders an input selector and record controls that refuse to arm without MIDI', async () => {
+    render(App);
+    await screen.findByText(/Web MIDI 不可用/);
+
+    // The input selector exists but offers no devices.
+    const inputSelect = screen.getByTestId('input-select') as HTMLSelectElement;
+    expect(inputSelect).toBeTruthy();
+    expect(inputSelect.disabled).toBe(true);
+
+    // Every track exposes an arm button; with no playback it is disabled,
+    // and no pending-confirmation panel is shown.
+    const arm = screen.getByTestId('arm-0') as HTMLButtonElement;
+    expect(arm.disabled).toBe(true);
+    expect(screen.queryByTestId('recording-panel')).toBeNull();
+  });
 });

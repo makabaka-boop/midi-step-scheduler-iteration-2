@@ -6,7 +6,8 @@
 
   // The controller instance never changes for the app lifetime.
   // svelte-ignore state_referenced_locally
-  const { transport, tempo, outputs, selectedOutputId, midiStatus } = controller;
+  const { transport, tempo, outputs, inputs, selectedOutputId, selectedInputId, midiStatus } =
+    controller;
 
   const canPlay = $derived($selectedOutputId !== null && $midiStatus === 'ready');
 </script>
@@ -48,6 +49,23 @@
         {#each $outputs as output (output.id)}
           <option value={output.id} disabled={!output.connected}>
             {output.name}{output.connected ? '' : '（已断开）'}
+          </option>
+        {/each}
+      </select>
+    </label>
+
+    <label>
+      输入设备（MIDI 键盘）
+      <select
+        data-testid="input-select"
+        value={$selectedInputId ?? ''}
+        disabled={$inputs.length === 0}
+        onchange={(e) => controller.selectInput(e.currentTarget.value || null)}
+      >
+        <option value="">（无输入）</option>
+        {#each $inputs as input (input.id)}
+          <option value={input.id} disabled={!input.connected}>
+            {input.name}{input.connected ? '' : '（已断开）'}
           </option>
         {/each}
       </select>
