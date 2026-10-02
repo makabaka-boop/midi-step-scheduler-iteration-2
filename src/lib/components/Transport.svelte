@@ -6,9 +6,11 @@
 
   // The controller instance never changes for the app lifetime.
   // svelte-ignore state_referenced_locally
-  const { transport, tempo, outputs, selectedOutputId, midiStatus } = controller;
+  const { transport, tempo, outputs, inputs, selectedOutputId, selectedInputId, midiStatus } =
+    controller;
 
   const canPlay = $derived($selectedOutputId !== null && $midiStatus === 'ready');
+  const hasInputs = $derived($inputs.some((i) => i.connected));
 </script>
 
 <div class="panel">
@@ -37,6 +39,23 @@
     </label>
 
     <label>
+      输入设备
+      <select
+        data-testid="input-select"
+        value={$selectedInputId ?? ''}
+        disabled={$inputs.length === 0}
+        onchange={(e) => controller.selectInput(e.currentTarget.value || null)}
+      >
+        <option value="">（无输入）</option>
+        {#each $inputs as input (input.id)}
+          <option value={input.id} disabled={!input.connected}>
+            {input.name}{input.connected ? '' : '（已断开）'}
+          </option>
+        {/each}
+      </select>
+    </label>
+
+    <label>
       输出设备
       <select
         data-testid="output-select"
@@ -54,5 +73,8 @@
     </label>
 
     <span>状态：{$transport === 'playing' ? '播放中' : $transport === 'paused' ? '已暂停' : '已停止'}</span>
+    {#if !hasInputs && $midiStatus === 'ready'}
+      <span data-testid="no-input-hint" class="hint">无 MIDI 输入：仍可编辑与播放</span>
+    {/if}
   </div>
 </div>

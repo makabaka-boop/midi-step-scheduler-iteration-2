@@ -8,7 +8,9 @@
 - 每步参数：音高（0–127，带音名显示）、力度（1–127）、门长（步长的 5%–100%）
 - 播放 / 暂停 / 停止，20–300 BPM 实时变速
 - 输出设备下拉选择；设备热插拔自动更新，断开的设备会标注并触发清理
+- **单轨"录制待确认"**：播放中为选中的一轨启用录制，用 MIDI 键盘演奏一轮；草稿与正在播放的乐谱隔离，确认后一次性写入
 - **无 Web MIDI 或未授权时**：乐谱编辑完全可用，播放按钮禁用——绝不假装在播放
+- **无 MIDI 输入时**：编辑与播放原乐谱完全正常，只是不能武装录制
 
 ## 快速开始（Docker）
 
@@ -19,7 +21,7 @@ docker compose run --rm verify  # 一次性验收：类型检查 + 全部测试 
 docker compose up web           # 开发服务器：http://localhost:5173
 ```
 
-`verify` 服务以退出码报告结果：0 表示类型检查、46 项测试与生产构建全部通过。
+`verify` 服务以退出码报告结果：0 表示类型检查、84 项测试与生产构建全部通过。
 
 ## 本地开发
 
@@ -42,10 +44,12 @@ src/lib/sequencer/
   clock.ts      可替换时钟：BrowserClock（生产）/ ManualClock（测试）
   midi.ts       MIDI 消息构造函数（noteOn/noteOff/…）
   output.ts     输出适配器：Web MIDI 端口 / 测试记录适配器
-  scheduler.ts  前瞻调度器（核心）
-  devices.ts    Web MIDI 访问、设备列表、热插拔跟踪
-src/lib/controller.ts  控制器：连接调度器、设备管理器与 Svelte stores
-src/lib/components/    Transport / TrackGrid / StepEditor
+  midiInput.ts  输入适配器：Web MIDI 输入端口（onmidimessage）/ 测试假键盘
+  scheduler.ts  前瞻调度器（核心）+ 节拍时间轴（nearestCell/boundaryAt）+ commitTake
+  devices.ts    Web MIDI 访问、输入/输出设备列表、热插拔与授权失效跟踪
+  recorder.ts   单轨"录制待确认"核心：草稿、节拍量化、门长换算与全部裁决
+src/lib/controller.ts  控制器：连接调度器、设备管理器、录制器与 Svelte stores
+src/lib/components/    Transport / TrackGrid / StepEditor / RecordPanel
 ```
 
 ### 前瞻调度
@@ -76,6 +80,20 @@ src/lib/components/    Transport / TrackGrid / StepEditor
 
 两条轨道复用同一 MIDI 通道和音高时，每个声音仍按 `(轨道, 全局步)` 独立记账；线路上的"键"维护的是持有它的声音 id 集合：**只有最后一个重叠声音结束时才发出线路 note-off**。处理其中一条轨道（静音、关闭、改音高）绝不会提前结束另一条轨道仍应持续的声音；同轨同音高的重触发保护也只匹配本轨事件，不会误伤另一轨的 note-off。
 
+### 单轨"录制待确认"
+
+播放中点某条音轨的 **● 录制这一轨**，即进入 `armed → recording → completed` 流程，用 MIDI 键盘录入**一轮**（该轨当前步数次循环）。核心在 `recorder.ts` 的 `TakeRecorder`，它与调度器、控制器、Svelte 状态共用**同一份录制结果**：
+
+- **节拍解释**：note-on/note-off 的时间戳直接对照调度器已到达的节拍时间轴（`nearestCell` / `boundaryAt`，按到达边界的时间轴量化，最近边界中点规则；变速时用该格当时的步长），不是另起一条时钟。门长 = 物理按住时长 ÷ 起音格步长，钳制到 5%–100%。
+- **稳定且可见的裁决**：每条裁决都带原因（界面"裁决"列表可见）——
+  - **同音高重触发**：遵循 MIDI 语义，新的按下重启声音；落在同一格则后一次覆盖前一次（`retriggered`），跨格则两音都保留、前一个在两格边界处钳断（`tail-clamped`）；
+  - **同格竞争**（不同音高）：起音更早者胜，同时按下以更低音高破平局，败者记 `contended`；
+  - **跨循环尾部 / 跨边界**：门长绝不超过一个步格，超长部分钳到格末并记 `tail-clamped`；
+  - **零力度 note-on** 按 running-status 当作 note-off；轮前、轮后的按下分别记 `ignored-early` / `ignored-late`。
+- **草稿隔离**：录制期间只维护独立草稿（`takeDraft` store），不改变正在播放的乐谱、不动已排队输出、不回送任何 MIDI；网格上以高亮显示草稿格、白框显示当前按住的键。
+- **一次提交**：用户确认时把本轮有效步格一次性写入该轨（录到的格开、其余格关），再让调度器 `commitTake` 做一次整轨对账——旧声音立即释放、新内容在下一次播放头经过时发声，绝不补发；确认瞬间的消息顺序因此确定（先释放被覆盖的旧音，且不触碰其他轨/共享通道仍在响的声音）。
+- **丢弃路径**：取消、停止、暂停、输入设备断开、MIDI 授权失效，都会丢弃未确认草稿并清空所有悬挂的 held 音符。录制中的音轨禁止编辑；其他音轨照常编辑、播放，共享输出通道不受影响。
+
 ### 队列与发声音符的清理
 
 暂停、停止、切换输出设备、设备断开，都执行同一套清理：
@@ -92,17 +110,19 @@ src/lib/components/    Transport / TrackGrid / StepEditor
 
 - `ManualClock` 让测试手动推进时间，可精确模拟**迟到回调**（计时器回调观察到跳跃后的真实时间）、**停止边界**（到期但未派发的步被取消）、**重复点击**（任意 play/stop 序列后至多一个定时器、无重复音符）；
 - `RecordingOutputAdapter` 记录每条消息及其时间戳，断言无需真实硬件；
-- `FakeMidiAccess`（`tests/fakeMidi.ts`）模拟设备**热插拔**与断开；
+- `FakeMidiAccess`（`tests/fakeMidi.ts`）模拟设备**热插拔**、输入键盘与**授权失效**；`WebMidiInputAdapter` 直接绑定假输入口，测试用同一 `ManualClock` 时间戳喂入音符，覆盖**变速、同音高重触发、断开、授权失效及确认瞬间的输出消息顺序**；
 - 页面测试在 jsdom 中渲染完整应用（无 `navigator.requestMIDIAccess`），验证"可编辑但不假装播放"。
 
 ## 测试
 
-`npm test`（Vitest）共 46 项：
+`npm test`（Vitest）共 84 项：
 
-- `tests/scheduler.test.ts` — 前瞻排程、变速重排、停止/暂停清理、迟到回调、重复点击、设备切换与断开、门长、多轨独立循环、重触发保护、**播放中编辑（关闭/音高/力度/门长/缩短/静音且不带动其他轨）、共享通道同音高的独立声音**
+- `tests/scheduler.test.ts` — 前瞻排程、变速重排、停止/暂停清理、迟到回调、重复点击、设备切换与断开、门长、多轨独立循环、重触发保护、播放中编辑、共享通道同音高的独立声音、**节拍时间轴量化与 `commitTake` 整轨对账（确认瞬间先释放旧音、不触碰兄弟音轨）**
+- `tests/recorder.test.ts` — 录制核心：武装/生命周期、节拍量化、门长换算、变速中的各格步长、同音高重触发（同格/跨格）、同格竞争与时序破平、零力度 note-on、跨循环尾部钳制、取消/各异常路径丢弃草稿与悬挂音符
+- `tests/recordFlow.test.ts` — 控制器端到端：一轮录制不影响播放、拒绝武装、取消/停止/暂停丢弃、输入断开与授权失效清理、变速量化、确认时整轨原子写入且不补发、无输入仍可编辑播放、同轨编辑锁
 - `tests/stress.test.ts` — 400 拍随机编辑（开关/音高/门长/静音/伸缩/改通道/批量改）下的线路不变量：播放中绝不出现"未持有却 note-off"，停止后无卡音；编辑一条轨不改变另一条轨的步边界时刻
 - `tests/devices.test.ts` — 设备列表、热插拔、断开清理、切换输出、无 MIDI 时拒绝播放
-- `tests/app.test.ts` — 无 MIDI 硬件的页面级测试：编辑、增删轨、步数变更、播放禁用
+- `tests/app.test.ts` — 无 MIDI 硬件的页面级测试：编辑、增删轨、步数变更、播放禁用、录制控件在无 MIDI 时无害
 
 ## 验收
 

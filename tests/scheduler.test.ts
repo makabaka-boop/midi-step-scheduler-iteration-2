@@ -567,3 +567,74 @@ describe('Scheduler shared channel and pitch', () => {
     expect(offs[0]!.timeMs).toBeGreaterThanOrEqual(1 + STEP_MS);
   });
 });
+
+describe('Scheduler commitTake (recorded pass reconciliation)', () => {
+  it('releases a sounding overwritten cell before joining the new note, sibling untouched', () => {
+    // Track 0 cell 0 currently plays 60 with a long gate; a take records
+    // 72 there. At commit (t=100, 60 sounding) the old 60 must be closed
+    // at once; track 1 sharing the channel with 64 keeps ringing.
+    const rig = makeRig({
+      tracks: [
+        { length: 4, enabled: [0], gate: 1.0, pitch: 60, channel: 0 },
+        { length: 4, enabled: [0], gate: 1.0, pitch: 64, channel: 0 }
+      ]
+    });
+    rig.scheduler.play();
+    rig.clock.advance(100); // 60 and 64 sounding
+
+    // Apply a recorded pass atomically: cell 0 -> 72 (gate 0.5), rest off.
+    rig.pattern.tracks[0]!.steps.forEach((step, i) => {
+      if (i === 0) {
+        step.enabled = true;
+        step.pitch = 72;
+        step.velocity = 110;
+        step.gate = 0.5;
+      } else {
+        step.enabled = false;
+      }
+    });
+
+    const before = rig.out.sent.length;
+    rig.scheduler.commitTake(rig.pattern.tracks[0]!.id);
+    const burst = rig.out.sent.slice(before).map((m) => m.message);
+
+    // First (and only) commit message is the immediate note-off for 60.
+    expect(burst).toEqual([[0x80, 60, 0]]);
+    // The sibling 64 was not released.
+    expect(rig.out.sent.some((m) => m.message[1] === 64 && (m.message[0]! & 0xf0) === 0x80)).toBe(
+      false
+    );
+    // 72 does not fire retroactively; it sounds on the next pass.
+    expect(rig.out.sent.some((m) => m.message[1] === 72)).toBe(false);
+
+    // Next loop: 72 fires at the step-4 boundary, 60 never returns.
+    rig.clock.advance(125 * 4);
+    const ons = noteOns(rig.out).map((m) => m.message[1]);
+    expect(ons).toContain(72);
+    expect(ons.slice(2)).not.toContain(60);
+    rig.scheduler.stop();
+    // No stuck notes.
+    expect(rig.scheduler.soundingNotes).toBe(0);
+  });
+
+  it('does nothing when not playing', () => {
+    const rig = makeRig({ tracks: [{ length: 4, enabled: [0] }] });
+    rig.pattern.tracks[0]!.steps[0]!.enabled = true;
+    expect(() => rig.scheduler.commitTake(rig.pattern.tracks[0]!.id)).not.toThrow();
+    expect(rig.out.sent.length).toBe(0);
+  });
+
+  it('exposes a beat timeline usable for nearest-cell quantization', () => {
+    const rig = makeRig({ tracks: [{ length: 8, enabled: [] }] });
+    rig.scheduler.play();
+    rig.clock.advance(300); // boundaries 0,1,2 reached
+    expect(rig.scheduler.currentStep).toBe(2);
+    // A time inside cell 2 maps to step 2; just before the midpoint it
+    // stays in cell 2, just after it snaps to cell 3 (if already planned).
+    expect(rig.scheduler.nearestCell(1 + 2 * STEP_MS + 10)?.step).toBe(2);
+    const b = rig.scheduler.boundaryAt(2);
+    expect(b?.time).toBe(1 + 2 * STEP_MS);
+    expect(b?.dur).toBe(STEP_MS);
+    rig.scheduler.stop();
+  });
+});

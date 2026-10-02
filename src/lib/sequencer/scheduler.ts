@@ -40,6 +40,7 @@
 import type { Clock, TimerHandle } from './clock';
 import { noteOff, noteOn } from './midi';
 import type { MidiOutputAdapter } from './output';
+import type { BeatCell } from './recorder';
 import { STEPS_PER_BEAT, type Pattern } from './types';
 
 export type TransportState = 'stopped' | 'playing' | 'paused';
@@ -90,6 +91,8 @@ export interface SchedulerOptions {
 const DEFAULT_LOOKAHEAD_MS = 120;
 const DEFAULT_TICK_MS = 25;
 const DEFAULT_CATCH_UP_MS = 240;
+/** Reached boundaries kept around so a recorder can quantize recent input. */
+const KEEP_BOUNDARIES = 512;
 
 export class Scheduler {
   private readonly clock: Clock;
@@ -110,11 +113,19 @@ export class Scheduler {
   private nextStepTime = 0;
   /** Last step boundary that came due (drives tempo-change re-planning). */
   private lastBoundary: { step: number; time: number } = { step: -1, time: 0 };
+  /**
+   * Boundaries the playhead has actually reached, each with the step
+   * duration that was in force for the cell starting there. The log is
+   * the scheduler's beat timeline: input recording quantizes note-ons
+   * against it, so a note pressed anywhere in the grid — including
+   * across a tempo change — maps to a definite step and gate.
+   */
+  private reachedBoundaries: { step: number; time: number; dur: number }[] = [];
 
   /** Queued, not yet dispatched events — the "已排队消息". */
   private pending: ScheduledEvent[] = [];
   /** Steps scheduled but not yet reached (for the playhead callback). */
-  private stepTimes: { step: number; time: number }[] = [];
+  private stepTimes: { step: number; time: number; dur: number }[] = [];
   /** Notes this scheduler started and has not yet closed, keyed by note-on event id. */
   private activeNotes = new Map<number, ActiveNote>();
   /**
@@ -147,6 +158,11 @@ export class Scheduler {
 
   get position(): number {
     return this.stepIndex;
+  }
+
+  /** Global step of the last boundary the playhead actually reached. */
+  get currentStep(): number {
+    return this.lastBoundary.step;
   }
 
   get queuedEvents(): readonly ScheduledEvent[] {
@@ -187,6 +203,7 @@ export class Scheduler {
     if (!this.output) return false;
     if (this.state === 'stopped') {
       this.stepIndex = 0;
+      this.reachedBoundaries = [];
     }
     this.setState('playing');
     // Start the (possibly resumed) step almost immediately, but on the
@@ -221,6 +238,7 @@ export class Scheduler {
     this.stepIndex = 0;
     this.nextStepTime = 0;
     this.lastBoundary = { step: -1, time: 0 };
+    this.reachedBoundaries = [];
   }
 
   /**
@@ -270,6 +288,76 @@ export class Scheduler {
     return 60000 / (this.getTempo() * STEPS_PER_BEAT);
   }
 
+  /**
+   * Quantize a point on the clock timeline to the nearest step cell using
+   * the scheduler's own beat timeline — the exact grid the playhead is
+   * following, including every tempo change that happened in between.
+   *
+   * A note that lands inside a cell maps to that cell; one that lands in
+   * the lookahead gap (after the last reached boundary, before the next
+   * one is reached) snaps to the upcoming boundary once it is closer.
+   * Null when no cell can yet account for the time (before the first
+   * boundary is scheduled/reached).
+   */
+  nearestCell(timeMs: number): BeatCell | null {
+    let prev: { step: number; time: number; dur: number } | null = null;
+    for (const b of this.reachedBoundaries) {
+      if (b.time <= timeMs) prev = b;
+      else break;
+    }
+    // Upcoming boundaries are still in the lookahead queue; use the
+    // earliest planned one for nearest-boundary snapping.
+    const next =
+      this.stepTimes.length > 0
+        ? [...this.stepTimes].sort((a, b) => a.step - b.step)[0]!
+        : null;
+    if (!prev) {
+      return next && next.time <= timeMs ? { step: next.step, dur: next.dur } : null;
+    }
+    if (!next) {
+      return { step: prev.step, dur: prev.dur };
+    }
+    if (next.step !== prev.step + 1) {
+      // A gap (e.g. a catch-up skipped boundary): only reached cells are
+      // reliable until the upcoming one is actually reached.
+      return timeMs >= next.time
+        ? { step: next.step, dur: next.dur }
+        : { step: prev.step, dur: prev.dur };
+    }
+    // Midpoint tie rule: strictly inside the previous cell keeps it.
+    return timeMs - prev.time < next.time - timeMs
+      ? { step: prev.step, dur: prev.dur }
+      : { step: next.step, dur: next.dur };
+  }
+
+  /**
+   * Clock time at which a global step boundary falls, and the cell
+   * duration in force there. Looks up reached boundaries directly and
+   * the earliest planned upcoming boundary; null once the boundary is
+   * older than the retained log or further away than the lookahead.
+   */
+  boundaryAt(globalStep: number): { time: number; dur: number } | null {
+    for (const b of this.reachedBoundaries) {
+      if (b.step === globalStep) return { time: b.time, dur: b.dur };
+      if (b.step > globalStep) break;
+    }
+    const planned = this.stepTimes.find((s) => s.step === globalStep);
+    return planned ? { time: planned.time, dur: planned.dur } : null;
+  }
+
+  /**
+   * Commit one recorded pass for a track in a single reconciliation pass.
+   * The pattern already carries the committed cells (recorded steps on,
+   * unrecorded ones off); this runs the same whole-track reconciliation
+   * as a burst of live edits — never rewinding the clock, never touching
+   * other tracks — so stale queued/sounding voices are released at once
+   * and due recorded cells fire on their existing boundaries.
+   */
+  commitTake(trackId: string): void {
+    if (this.state !== 'playing') return;
+    this.reconcileTrack(trackId, {});
+  }
+
   // -------------------------------------------------------------------
 
   private setState(state: TransportState): void {
@@ -308,7 +396,7 @@ export class Scheduler {
       if (time >= now - this.catchUpMs) {
         this.scheduleStep(step, time, stepDur);
       }
-      this.stepTimes.push({ step, time });
+      this.stepTimes.push({ step, time, dur: stepDur });
       this.nextStepTime += stepDur;
       this.stepIndex += 1;
     }
@@ -417,7 +505,11 @@ export class Scheduler {
       this.stepTimes = this.stepTimes.filter((s) => s.time > now);
       for (const s of reached) {
         this.lastBoundary = { step: s.step, time: s.time };
+        this.reachedBoundaries.push({ step: s.step, time: s.time, dur: s.dur });
         this.onStep?.(s.step, s.time);
+      }
+      if (this.reachedBoundaries.length > KEEP_BOUNDARIES) {
+        this.reachedBoundaries.splice(0, this.reachedBoundaries.length - KEEP_BOUNDARIES);
       }
     }
   }
@@ -564,7 +656,6 @@ export class Scheduler {
     // unmute would skip a due note. Other tracks and the timeline are
     // untouched — we only plan this track's voices on existing boundaries.
     if (!muted && !removed && track) {
-      const stepDur = Math.max(1, this.stepDuration());
       for (const s of this.stepTimes) {
         // Same horizon as a tick: overdue within the catch-up window
         // (a late timer is still allowed to fire), up to the lookahead edge.
@@ -579,7 +670,9 @@ export class Scheduler {
               [...this.activeNotes.values()].some(
                 (n) => n.trackId === trackId && n.step === s.step
               );
-            if (!hasVoice) this.scheduleTrackStep(track, s.step, s.time, stepDur);
+            // Plan on the boundary's own step duration: after a tempo
+            // change the queued boundaries already carry the new grid.
+            if (!hasVoice) this.scheduleTrackStep(track, s.step, s.time, s.dur);
           }
         }
       }

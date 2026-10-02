@@ -85,4 +85,25 @@ describe('App without Web MIDI', () => {
     expect((screen.getByTestId('play') as HTMLButtonElement).disabled).toBe(true);
     expect(screen.getByText(/已停止/)).toBeTruthy();
   });
+
+  it('shows recording controls but keeps them harmless without MIDI', async () => {
+    render(App);
+    await screen.findByText(/Web MIDI 不可用/);
+
+    // Every track exposes a record-arm button, but without playback it
+    // cannot enter a recording state or open a draft panel.
+    const arm = screen.getByTestId('arm-0') as HTMLButtonElement;
+    await fireEvent.click(arm);
+    expect(screen.queryByTestId('record-panel')).toBeNull();
+
+    // Input selector exists (disabled, no devices).
+    const input = screen.getByTestId('input-select') as HTMLSelectElement;
+    expect(input).toBeTruthy();
+    expect(input.disabled).toBe(true);
+
+    // Editing the score still works — recording added no modal lock.
+    const step = screen.getByTestId('step-0-1');
+    await fireEvent.click(step);
+    expect(step.className).toContain('on');
+  });
 });

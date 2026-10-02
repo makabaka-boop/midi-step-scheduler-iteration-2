@@ -4,6 +4,7 @@
   import Transport from './lib/components/Transport.svelte';
   import TrackGrid from './lib/components/TrackGrid.svelte';
   import StepEditor from './lib/components/StepEditor.svelte';
+  import RecordPanel from './lib/components/RecordPanel.svelte';
 
   const controller = new SequencerController();
   const { pattern, midiStatus, notice, selection } = controller;
@@ -43,6 +44,7 @@
 
   <Transport {controller} />
   <TrackGrid {controller} />
+  <RecordPanel {controller} />
 
   {#if $selStep}
     <StepEditor
